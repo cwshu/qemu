@@ -227,7 +227,8 @@ static int pmp_is_in_range(CPURISCVState *env, int pmp_index, target_ulong addr)
  * Check if the address has required RWX privs to complete desired operation
  */
 bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
-    target_ulong size, pmp_priv_t privs, target_ulong mode)
+    target_ulong size, pmp_priv_t privs, pmp_priv_t *allowed_privs_out,
+    target_ulong mode)
 {
     int i = 0;
     int ret = -1;
@@ -238,6 +239,9 @@ bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
 
     /* Short cut if no rules */
     if (0 == pmp_get_num_rules(env)) {
+        if (allowed_privs_out) {
+            *allowed_privs_out = PMP_READ | PMP_WRITE | PMP_EXEC;
+        }
         return true;
     }
 
@@ -296,6 +300,7 @@ bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
     /* No rule matched */
     if (ret == -1) {
         if (mode == PRV_M) {
+            allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
             ret = 1; /* Privileged spec v1.10 states if no PMP entry matches an
                       * M-Mode access, the access succeeds */
         } else {
@@ -305,6 +310,9 @@ bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
         }
     }
 
+    if (allowed_privs_out) {
+        *allowed_privs_out = allowed_privs;
+    }
     return ret == 1 ? true : false;
 }
 
@@ -393,6 +401,26 @@ target_ulong pmpaddr_csr_read(CPURISCVState *env, uint32_t addr_index)
     }
 
     return val;
+}
+
+/*
+ * Convert PMP privilege to TLB page privilege.
+ */
+int pmp_priv_to_page_prot(pmp_priv_t pmp_priv)
+{
+    int prot = 0;
+
+    if (pmp_priv & PMP_READ) {
+        prot |= PAGE_READ;
+    }
+    if (pmp_priv & PMP_WRITE) {
+        prot |= PAGE_WRITE;
+    }
+    if (pmp_priv & PMP_EXEC) {
+        prot |= PAGE_EXEC;
+    }
+
+    return prot;
 }
 
 /*

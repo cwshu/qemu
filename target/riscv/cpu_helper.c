@@ -442,7 +442,7 @@ restart:
 
         if (riscv_feature(env, RISCV_FEATURE_PMP) &&
             !pmp_hart_has_privs(env, pte_addr, sizeof(target_ulong),
-            1 << MMU_DATA_LOAD, PRV_S)) {
+            1 << MMU_DATA_LOAD, NULL, PRV_S)) {
             return TRANSLATE_PMP_FAIL;
         }
 
@@ -679,6 +679,7 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     vaddr im_address;
     hwaddr pa = 0;
     int prot, prot2;
+    pmp_priv_t pmp_priv;
     bool pmp_violation = false;
     bool first_stage_error = true;
     bool two_stage_lookup = false;
@@ -743,7 +744,8 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
             if (riscv_feature(env, RISCV_FEATURE_PMP) &&
                 (ret == TRANSLATE_SUCCESS) &&
-                !pmp_hart_has_privs(env, pa, size, 1 << access_type, mode)) {
+                !pmp_hart_has_privs(env, pa, size, 1 << access_type,
+                                    NULL, mode)) {
                 ret = TRANSLATE_PMP_FAIL;
             }
 
@@ -771,7 +773,7 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     if (riscv_feature(env, RISCV_FEATURE_PMP) &&
         (ret == TRANSLATE_SUCCESS) &&
-        !pmp_hart_has_privs(env, pa, size, 1 << access_type, mode)) {
+        !pmp_hart_has_privs(env, pa, size, 1 << access_type, &pmp_priv, mode)) {
         ret = TRANSLATE_PMP_FAIL;
     }
     if (ret == TRANSLATE_PMP_FAIL) {
@@ -779,6 +781,8 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
 
     if (ret == TRANSLATE_SUCCESS) {
+        prot &= pmp_priv_to_page_prot(pmp_priv);
+
         if (pmp_is_range_in_tlb(env, pa & TARGET_PAGE_MASK, &tlb_size)) {
             tlb_set_page(cs, address & ~(tlb_size - 1), pa & ~(tlb_size - 1),
                          prot, mmu_idx, tlb_size);
