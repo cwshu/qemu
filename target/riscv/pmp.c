@@ -148,7 +148,18 @@ static void pmp_decode_napot(target_ulong a, target_ulong *sa, target_ulong *ea)
     } else {
         target_ulong t1 = ctz64(~a);
         target_ulong base = (a & ~(((target_ulong)1 << t1) - 1)) << 2;
-        target_ulong range = ((target_ulong)1 << (t1 + 3)) - 1;
+        target_ulong range;
+
+        /*
+         * Avoid overflow of left-shift operator, as it is undefined and
+         * sometimes cause error.
+         */
+        if ((t1 + 3) >= TARGET_LONG_BITS) {
+            range = -1;
+        } else {
+            range = ((target_ulong)1 << (t1 + 3)) - 1;
+        }
+
         *sa = base;
         *ea = base + range;
     }
