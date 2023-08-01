@@ -58,6 +58,7 @@
 #include "qapi/qapi-visit-common.h"
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/uefi/var-service-api.h"
+#include "hw/misc/riscv_world.h"
 
 /* KVM AIA only supports APLIC MSI. APLIC Wired is always emulated by QEMU. */
 static bool virt_use_kvm_aia_aplic_imsic(RISCVVirtAIAType aia_type)
@@ -89,6 +90,9 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_PCIE_PIO] =     {  0x3000000,       0x10000 },
     [VIRT_IOMMU_SYS] =    {  0x3010000,        0x1000 },
     [VIRT_PLATFORM_BUS] = {  0x4000000,     0x2000000 },
+    [VIRT_WGC_DRAM] =     {  0x6000000,        0x1000 },
+    [VIRT_WGC_FLASH] =    {  0x6001000,        0x1000 },
+    [VIRT_WGC_UART] =     {  0x6002000,        0x1000 },
     [VIRT_PLIC] =         {  0xc000000, VIRT_PLIC_SIZE(VIRT_CPUS_MAX * 2) },
     [VIRT_APLIC_M] =      {  0xc000000, APLIC_SIZE(VIRT_CPUS_MAX) },
     [VIRT_APLIC_S] =      {  0xd000000, APLIC_SIZE(VIRT_CPUS_MAX) },
@@ -113,6 +117,69 @@ static const MemMapEntry virt_memmap[] = {
 static MemMapEntry virt_high_pcie_memmap;
 
 #define VIRT_FLASH_SECTOR_SIZE (256 * KiB)
+
+/* wgChecker helpers */
+typedef struct WGCInfo {
+    int memmap_idx;
+    uint32_t irq_num;
+    uint32_t slot_count;
+
+    int num_of_child;
+    MemoryRegion *c_region[WGC_NUM_REGIONS];
+    uint64_t c_offset[WGC_NUM_REGIONS];
+} WGCInfo;
+
+enum {
+    WGC_DRAM,
+    WGC_FLASH,
+    WGC_UART,
+    WGC_NUM,
+};
+
+static WGCInfo virt_wgcinfo[] = {
+    [WGC_DRAM]  = { VIRT_WGC_DRAM, WGC_DRAM_IRQ, 16 },
+    [WGC_FLASH] = { VIRT_WGC_FLASH, WGC_FLASH_IRQ, 16 },
+    [WGC_UART]  = { VIRT_WGC_UART, WGC_UART_IRQ, 1 },
+};
+
+static void wgc_append_child(WGCInfo *info, MemoryRegion *region,
+                             uint64_t offset)
+{
+    info->c_region[info->num_of_child] = region;
+    info->c_offset[info->num_of_child] = offset;
+    info->num_of_child += 1;
+}
+
+static void create_fdt_wgchecker(RISCVVirtState *s,
+                                 WGCInfo *info, uint32_t irq_mmio_phandle)
+{
+    MachineState *mc = MACHINE(s);
+    char *nodename;
+    hwaddr base = s->memmap[info->memmap_idx].base;
+    hwaddr size = s->memmap[info->memmap_idx].size;
+
+    nodename = g_strdup_printf("/soc/wgchecker@%"HWADDR_PRIx, base);
+    qemu_fdt_add_subnode(mc->fdt, nodename);
+    qemu_fdt_setprop_string(mc->fdt, nodename, "compatible", "sifive,wgchecker2");
+    qemu_fdt_setprop_cell(mc->fdt, nodename, "interrupt-parent", irq_mmio_phandle);
+    if (s->aia_type == VIRT_AIA_TYPE_NONE) {
+        qemu_fdt_setprop_cells(mc->fdt, nodename, "interrupts",
+                               info->irq_num);
+    } else {
+        qemu_fdt_setprop_cells(mc->fdt, nodename, "interrupts",
+                               info->irq_num, 0x4);
+    }
+    qemu_fdt_setprop_cells(mc->fdt, nodename, "reg", 0x0, base, 0x0, size);
+    qemu_fdt_setprop_cell(mc->fdt, nodename, "#access-controller-cells", 7);
+}
+
+static void create_fdt_world(RISCVVirtState *s, uint32_t irq_mmio_phandle,
+                                  WGCInfo *wgcinfo, int wgc_num)
+{
+    for (int i=0; i<wgc_num; i++) {
+        create_fdt_wgchecker(s, &wgcinfo[i], irq_mmio_phandle);
+    }
+}
 
 static PFlashCFI01 *virt_flash_create1(RISCVVirtState *s,
                                        const char *name,
@@ -164,7 +231,8 @@ static void virt_flash_map1(PFlashCFI01 *flash,
 }
 
 static void virt_flash_map(RISCVVirtState *s,
-                           MemoryRegion *sysmem)
+                           MemoryRegion *sysmem,
+                           WGCInfo *info)
 {
     hwaddr flashsize = s->memmap[VIRT_FLASH].size / 2;
     hwaddr flashbase = s->memmap[VIRT_FLASH].base;
@@ -173,6 +241,15 @@ static void virt_flash_map(RISCVVirtState *s,
                     sysmem);
     virt_flash_map1(s->flash[1], flashbase + flashsize, flashsize,
                     sysmem);
+
+    if (info) {
+        wgc_append_child(info,
+                         sysbus_mmio_get_region(SYS_BUS_DEVICE(s->flash[0]), 0),
+                         flashbase);
+        wgc_append_child(info,
+                         sysbus_mmio_get_region(SYS_BUS_DEVICE(s->flash[1]), 0),
+                         flashbase + flashsize);
+    }
 }
 
 static void create_pcie_irq_map(RISCVVirtState *s, void *fdt, char *nodename,
@@ -282,6 +359,17 @@ static void create_fdt_socket_cpus(RISCVVirtState *s, int socket,
         qemu_fdt_setprop_string(ms->fdt, cpu_name, "device_type", "cpu");
         riscv_socket_fdt_write_id(ms, cpu_name, socket);
         qemu_fdt_setprop_cell(ms->fdt, cpu_name, "phandle", cpu_phandle);
+
+        /* Add RISC-V World CPU properties if enabled */
+        if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+            /* Add RISC-V World CPU properties as u64 (2 cells each) */
+            qemu_fdt_setprop_u64(ms->fdt, cpu_name, "riscv,pmwid",
+                                 (uint64_t)cpu_ptr->cfg.pmwid);
+            qemu_fdt_setprop_u64(ms->fdt, cpu_name, "riscv,pmlwidlist",
+                                 (uint64_t)cpu_ptr->cfg.pmlwidlist);
+            qemu_fdt_setprop_u64(ms->fdt, cpu_name, "riscv,pmwidlist",
+                                 (uint64_t)cpu_ptr->cfg.pmwidlist);
+        }
 
         intc_phandles[cpu] = (*phandle)++;
 
@@ -750,6 +838,18 @@ static void create_fdt_sockets(RISCVVirtState *s,
                           RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ);
     qemu_fdt_setprop_cell(ms->fdt, "/cpus", "#size-cells", 0x0);
     qemu_fdt_setprop_cell(ms->fdt, "/cpus", "#address-cells", 0x1);
+
+    /* Add global RISC-V World properties if enabled */
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        g_assert(world_config != NULL);
+        qemu_fdt_setprop_cell(ms->fdt, "/cpus", "riscv,nworlds",
+                              world_config->nworlds);
+        if (world_config->trustedwid != NO_TRUSTEDWID) {
+            qemu_fdt_setprop_cell(ms->fdt, "/cpus", "sifive,trustedwid",
+                                  world_config->trustedwid);
+        }
+    }
+
     qemu_fdt_add_subnode(ms->fdt, "/cpus/cpu-map");
 
     intc_phandles = g_new0(uint32_t, ms->smp.cpus);
@@ -1120,7 +1220,7 @@ static void create_fdt_iommu(RISCVVirtState *s, uint16_t bdf)
 
 static void finalize_fdt(RISCVVirtState *s)
 {
-    uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
+    uint32_t phandle = 2, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
     uint32_t irq_pcie_phandle = 1, irq_virtio_phandle = 1;
     uint32_t iommu_sys_phandle = 1;
 
@@ -1142,6 +1242,10 @@ static void finalize_fdt(RISCVVirtState *s)
     create_fdt_uart(s, irq_mmio_phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
+
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        create_fdt_world(s, irq_mmio_phandle, virt_wgcinfo, WGC_NUM);
+    }
 }
 
 static void create_fdt(RISCVVirtState *s)
@@ -1419,6 +1523,72 @@ static void virt_build_smbios(RISCVVirtState *s)
     }
 }
 
+static DeviceState *create_wgc(WGCInfo *info, DeviceState *irqchip)
+{
+    MemoryRegion *system_memory = get_system_memory();
+    DeviceState *wgc;
+    MemoryRegion *upstream_mr, *downstream_mr;
+    qemu_irq irq = qdev_get_gpio_in(irqchip, info->irq_num);
+    hwaddr base, size;
+
+    /* Unmap downstream_mr from system_memory if it is already mapped. */
+    for (int i = 0; i < info->num_of_child; i++) {
+        downstream_mr = info->c_region[i];
+
+        g_assert(downstream_mr);
+        if (downstream_mr->container == system_memory) {
+            memory_region_del_subregion(system_memory, downstream_mr);
+        }
+
+        /*
+         * Clear the offset of downstream_mr, so we could correctly do
+         * address_space_init() to it in wgchecker.
+         */
+        memory_region_set_address(downstream_mr, 0);
+    }
+
+    base = virt_memmap[info->memmap_idx].base;
+    size = virt_memmap[info->memmap_idx].size;
+
+    wgc = riscv_wgchecker_create(
+        base, size, irq, info->slot_count, 0, 0,
+        info->num_of_child, info->c_region, info->c_offset, 0, NULL);
+
+    /* Map upstream_mr to system_memory */
+    for (int i = 0; i < info->num_of_child; i++) {
+        upstream_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(wgc), i + 1);
+        g_assert(upstream_mr);
+        memory_region_add_subregion(system_memory, info->c_offset[i],
+                                    upstream_mr);
+    }
+
+    return wgc;
+}
+
+static void virt_create_world(WGCInfo *wgcinfo, int wgc_num,
+                              DeviceState *irqchip)
+{
+    CPUState *cpu;
+
+    /* RISC-V Worlds global config */
+    riscv_world_create(VIRT_WORLD_NWORLDS,
+                       VIRT_WORLD_TRUSTEDWID,
+                       VIRT_WORLD_HWBYPASS,
+                       VIRT_WORLD_TZCOMPAT);
+
+    /* Enable RISC-V Worlds extension of each CPU */
+    CPU_FOREACH(cpu) {
+        CPURISCVState *env = cpu ? cpu_env(cpu) : NULL;
+
+        riscv_world_apply_cpu(env->mhartid, true);
+    }
+
+    /* Create all wgChecker devices */
+    for (int i = 0; i < wgc_num; i++) {
+        create_wgc(&wgcinfo[i], DEVICE(irqchip));
+    }
+}
+
 static void virt_machine_done(Notifier *notifier, void *data)
 {
     RISCVVirtState *s = container_of(notifier, RISCVVirtState,
@@ -1519,10 +1689,12 @@ static void virt_machine_done(Notifier *notifier, void *data)
 
 static void virt_machine_init(MachineState *machine)
 {
+    WGCInfo *wgcinfo = virt_wgcinfo;
     RISCVVirtState *s = RISCV_VIRT_MACHINE(machine);
     MemoryRegion *system_memory = get_system_memory();
     MemoryRegion *mask_rom = g_new(MemoryRegion, 1);
     DeviceState *mmio_irqchip, *virtio_irqchip, *pcie_irqchip;
+    SerialMM *uart;
     int i, base_hartid, hart_count;
     int socket_count = riscv_socket_count(machine);
 
@@ -1537,6 +1709,11 @@ static void virt_machine_init(MachineState *machine)
 
     if (!virt_aclint_allowed() && s->have_aclint) {
         error_report("'aclint' is only available with TCG acceleration");
+        exit(1);
+    }
+
+    if (!tcg_enabled() && s->have_worlds) {
+        error_report("'wg' is only available with TCG acceleration");
         exit(1);
     }
 
@@ -1666,6 +1843,11 @@ static void virt_machine_init(MachineState *machine)
     memory_region_add_subregion(system_memory, s->memmap[VIRT_DRAM].base,
                                 machine->ram);
 
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        wgc_append_child(&wgcinfo[WGC_DRAM], machine->ram,
+                         s->memmap[VIRT_DRAM].base);
+    }
+
     /* boot rom */
     memory_region_init_rom(mask_rom, NULL, "riscv_virt_board.mrom",
                            s->memmap[VIRT_MROM].size, &error_fatal);
@@ -1693,9 +1875,15 @@ static void virt_machine_init(MachineState *machine)
 
     create_platform_bus(s, mmio_irqchip);
 
-    serial_mm_init(system_memory, s->memmap[VIRT_UART0].base,
+    uart = serial_mm_init(system_memory, s->memmap[VIRT_UART0].base,
         0, qdev_get_gpio_in(mmio_irqchip, UART0_IRQ), 399193,
         serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        wgc_append_child(&wgcinfo[WGC_UART],
+                         sysbus_mmio_get_region(SYS_BUS_DEVICE(uart), 0),
+                         s->memmap[VIRT_UART0].base);
+    }
 
     sysbus_create_simple("goldfish_rtc", s->memmap[VIRT_RTC].base,
         qdev_get_gpio_in(mmio_irqchip, RTC_IRQ));
@@ -1705,7 +1893,16 @@ static void virt_machine_init(MachineState *machine)
         pflash_cfi01_legacy_drive(s->flash[i],
                                   drive_get(IF_PFLASH, 0, i));
     }
-    virt_flash_map(s, system_memory);
+
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        virt_flash_map(s, system_memory, &wgcinfo[WGC_FLASH]);
+    } else {
+        virt_flash_map(s, system_memory, NULL);
+    }
+
+    if (object_property_get_bool(OBJECT(s), "worlds", NULL)) {
+        virt_create_world(wgcinfo, WGC_NUM, mmio_irqchip);
+    }
 
     /* load/create device tree */
     if (machine->dtb) {
@@ -1755,6 +1952,20 @@ static void virt_machine_instance_init(Object *obj)
     s->oem_table_id = g_strndup(ACPI_BUILD_APPNAME8, 8);
     s->acpi = ON_OFF_AUTO_AUTO;
     s->iommu_sys = ON_OFF_AUTO_AUTO;
+}
+
+static bool virt_get_worlds(Object *obj, Error **errp)
+{
+    RISCVVirtState *s = RISCV_VIRT_MACHINE(obj);
+
+    return tcg_enabled() && s->have_worlds;
+}
+
+static void virt_set_worlds(Object *obj, bool value, Error **errp)
+{
+    RISCVVirtState *s = RISCV_VIRT_MACHINE(obj);
+
+    s->have_worlds = value;
 }
 
 static char *virt_get_aia_guests(Object *obj, Error **errp)
@@ -1977,6 +2188,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "iommu-sys",
                                           "Enable IOMMU platform device");
+
+    object_class_property_add_bool(oc, "worlds", virt_get_worlds,
+                                   virt_set_worlds);
+    object_class_property_set_description(oc, "worlds",
+                                              "Set on/off to enable/disable the "
+                                              "RISC-V Worlds.");
 }
 
 static const TypeInfo virt_machine_typeinfo = {
