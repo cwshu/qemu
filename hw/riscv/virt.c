@@ -127,6 +127,9 @@ typedef struct WGCInfo {
     int num_of_child;
     MemoryRegion *c_region[WGC_NUM_REGIONS];
     uint64_t c_offset[WGC_NUM_REGIONS];
+
+    int num_of_child_fdt;
+    uint32_t c_phandle[WGC_NUM_REGIONS];
 } WGCInfo;
 
 enum {
@@ -148,6 +151,48 @@ static void wgc_append_child(WGCInfo *info, MemoryRegion *region,
     info->c_region[info->num_of_child] = region;
     info->c_offset[info->num_of_child] = offset;
     info->num_of_child += 1;
+}
+
+static void wgc_append_child_fdt(WGCInfo *info, uint32_t phandle)
+{
+    info->c_phandle[info->num_of_child_fdt] = cpu_to_be32(phandle);
+    info->num_of_child_fdt += 1;
+}
+
+static void create_fdt_wgchecker(RISCVVirtState *s,
+                                 WGCInfo *info, uint32_t irq_mmio_phandle)
+{
+    MachineState *mc = MACHINE(s);
+    char *nodename;
+    hwaddr base = s->memmap[info->memmap_idx].base;
+    hwaddr size = s->memmap[info->memmap_idx].size;
+
+    nodename = g_strdup_printf("/soc/wgchecker@%"HWADDR_PRIx, base);
+    qemu_fdt_add_subnode(mc->fdt, nodename);
+    qemu_fdt_setprop_string(mc->fdt, nodename, "compatible", "sifive,wgchecker2");
+    qemu_fdt_setprop_cell(mc->fdt, nodename, "interrupt-parent", irq_mmio_phandle);
+    if (s->aia_type == VIRT_AIA_TYPE_NONE) {
+        qemu_fdt_setprop_cells(mc->fdt, nodename, "interrupts",
+                               info->irq_num);
+    } else {
+        qemu_fdt_setprop_cells(mc->fdt, nodename, "interrupts",
+                               info->irq_num, 0x4);
+    }
+    qemu_fdt_setprop_cells(mc->fdt, nodename, "reg", 0x0, base, 0x0, size);
+    qemu_fdt_setprop_cell(mc->fdt, nodename, "sifive,slot-count", info->slot_count);
+
+    if (info->num_of_child_fdt > 0) {
+        qemu_fdt_setprop(mc->fdt, nodename, "sifive,subordinates", info->c_phandle,
+                         info->num_of_child_fdt * sizeof(uint32_t));
+    }
+}
+
+static void create_fdt_worldguard(RISCVVirtState *s, uint32_t irq_mmio_phandle,
+                                  WGCInfo *wgcinfo, int wgc_num)
+{
+    for (int i=0; i<wgc_num; i++) {
+        create_fdt_wgchecker(s, &wgcinfo[i], irq_mmio_phandle);
+    }
 }
 
 static PFlashCFI01 *virt_flash_create1(RISCVVirtState *s,
@@ -291,6 +336,7 @@ static void create_fdt_socket_cpus(RISCVVirtState *s, int socket,
         g_autofree char *core_name = NULL;
         g_autofree char *intc_name = NULL;
         g_autofree char *sv_name = NULL;
+        g_autofree char *wgcpu_name = NULL;
 
         cpu_phandle = (*phandle)++;
 
@@ -340,18 +386,45 @@ static void create_fdt_socket_cpus(RISCVVirtState *s, int socket,
         qemu_fdt_setprop(ms->fdt, intc_name, "interrupt-controller", NULL, 0);
         qemu_fdt_setprop_cell(ms->fdt, intc_name, "#interrupt-cells", 1);
 
+        if (object_property_get_bool(OBJECT(s), "wg", NULL)) {
+            int num_mwidlist;
+            g_autofree uint32_t *mwidlist_cells = NULL;
+            uint32_t wgcpu_phandle = (*phandle)++;
+
+            wgcpu_name = g_strdup_printf("%s/worldguard", cpu_name);
+            qemu_fdt_add_subnode(ms->fdt, wgcpu_name);
+            qemu_fdt_setprop_cell(ms->fdt, wgcpu_name, "phandle",
+                                  wgcpu_phandle);
+            qemu_fdt_setprop_string(ms->fdt, wgcpu_name, "compatible",
+                                    "riscv,wgcpu");
+            qemu_fdt_setprop_cell(ms->fdt, wgcpu_name, "mwid",
+                                  cpu_ptr->cfg.mwid);
+
+            num_mwidlist = 0;
+            mwidlist_cells = g_new0(uint32_t, 32);
+            for (int i=0; i<32; i++) {
+                if (cpu_ptr->cfg.mwidlist & BIT(i)) {
+                    mwidlist_cells[num_mwidlist++] = cpu_to_be32(i);
+                }
+            }
+            qemu_fdt_setprop(ms->fdt, wgcpu_name, "mwidlist",
+                             mwidlist_cells, num_mwidlist * sizeof(uint32_t));
+        }
+
         core_name = g_strdup_printf("%s/core%d", clust_name, cpu);
         qemu_fdt_add_subnode(ms->fdt, core_name);
         qemu_fdt_setprop_cell(ms->fdt, core_name, "cpu", cpu_phandle);
     }
 }
 
-static void create_fdt_socket_memory(RISCVVirtState *s, int socket)
+static void create_fdt_socket_memory(RISCVVirtState *s, int socket,
+                                     uint32_t *phandle)
 {
     g_autofree char *mem_name = NULL;
     hwaddr addr;
     uint64_t size;
     MachineState *ms = MACHINE(s);
+    uint32_t memory_phandle = (*phandle)++;
 
     addr = s->memmap[VIRT_DRAM].base + riscv_socket_mem_offset(ms, socket);
     size = riscv_socket_mem_size(ms, socket);
@@ -360,6 +433,11 @@ static void create_fdt_socket_memory(RISCVVirtState *s, int socket)
     qemu_fdt_setprop_sized_cells(ms->fdt, mem_name, "reg", 2, addr, 2, size);
     qemu_fdt_setprop_string(ms->fdt, mem_name, "device_type", "memory");
     riscv_socket_fdt_write_id(ms, mem_name, socket);
+    qemu_fdt_setprop_cell(ms->fdt, mem_name, "phandle", memory_phandle);
+
+    if (object_property_get_bool(OBJECT(s), "wg", NULL)) {
+        wgc_append_child_fdt(&virt_wgcinfo[WGC_DRAM], memory_phandle);
+    }
 }
 
 static void create_fdt_socket_clint(RISCVVirtState *s,
@@ -820,7 +898,7 @@ static void create_fdt_sockets(RISCVVirtState *s,
         create_fdt_socket_cpus(s, socket, clust_name, phandle,
                                &intc_phandles[phandle_pos]);
 
-        create_fdt_socket_memory(s, socket);
+        create_fdt_socket_memory(s, socket, phandle);
 
         if (virt_aclint_allowed() && s->have_aclint) {
             create_fdt_socket_aclint(s, socket,
@@ -1003,10 +1081,11 @@ static void create_fdt_reset(RISCVVirtState *s, uint32_t *phandle)
 }
 
 static void create_fdt_uart(RISCVVirtState *s,
-                            uint32_t irq_mmio_phandle)
+                            uint32_t irq_mmio_phandle, uint32_t *phandle)
 {
     g_autofree char *name = NULL;
     MachineState *ms = MACHINE(s);
+    uint32_t uart_phandle = (*phandle)++;
 
     name = g_strdup_printf("/soc/serial@%"HWADDR_PRIx,
                            s->memmap[VIRT_UART0].base);
@@ -1022,9 +1101,14 @@ static void create_fdt_uart(RISCVVirtState *s,
     } else {
         qemu_fdt_setprop_cells(ms->fdt, name, "interrupts", UART0_IRQ, 0x4);
     }
+    qemu_fdt_setprop_cell(ms->fdt, name, "phandle", uart_phandle);
 
     qemu_fdt_setprop_string(ms->fdt, "/chosen", "stdout-path", name);
     qemu_fdt_setprop_string(ms->fdt, "/aliases", "serial0", name);
+
+    if (object_property_get_bool(OBJECT(s), "wg", NULL)) {
+        wgc_append_child_fdt(&virt_wgcinfo[WGC_UART], uart_phandle);
+    }
 }
 
 static void create_fdt_rtc(RISCVVirtState *s,
@@ -1056,6 +1140,7 @@ static void create_fdt_flash(RISCVVirtState *s)
     hwaddr flashsize = s->memmap[VIRT_FLASH].size / 2;
     hwaddr flashbase = s->memmap[VIRT_FLASH].base;
     g_autofree char *name = g_strdup_printf("/flash@%" PRIx64, flashbase);
+    uint32_t flash_phandle = 1;
 
     qemu_fdt_add_subnode(ms->fdt, name);
     qemu_fdt_setprop_string(ms->fdt, name, "compatible", "cfi-flash");
@@ -1063,6 +1148,11 @@ static void create_fdt_flash(RISCVVirtState *s)
                                  2, flashbase, 2, flashsize,
                                  2, flashbase + flashsize, 2, flashsize);
     qemu_fdt_setprop_cell(ms->fdt, name, "bank-width", 4);
+    qemu_fdt_setprop_cell(ms->fdt, name, "phandle", flash_phandle);
+
+    if (object_property_get_bool(OBJECT(s), "wg", NULL)) {
+        wgc_append_child_fdt(&virt_wgcinfo[WGC_FLASH], flash_phandle);
+    }
 }
 
 static void create_fdt_fw_cfg(RISCVVirtState *s)
@@ -1175,7 +1265,7 @@ static void create_fdt_iommu(RISCVVirtState *s, uint16_t bdf)
 
 static void finalize_fdt(RISCVVirtState *s)
 {
-    uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
+    uint32_t phandle = 2, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
     uint32_t irq_pcie_phandle = 1, irq_virtio_phandle = 1;
     uint32_t iommu_sys_phandle = 1;
 
@@ -1194,9 +1284,13 @@ static void finalize_fdt(RISCVVirtState *s)
 
     create_fdt_reset(s, &phandle);
 
-    create_fdt_uart(s, irq_mmio_phandle);
+    create_fdt_uart(s, irq_mmio_phandle, &phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
+
+    if (object_property_get_bool(OBJECT(s), "wg", NULL)) {
+        create_fdt_worldguard(s, irq_mmio_phandle, virt_wgcinfo, WGC_NUM);
+    }
 }
 
 static void create_fdt(RISCVVirtState *s)
