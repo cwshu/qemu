@@ -133,6 +133,77 @@ bool riscv_env_smode_dbltrp_enabled(CPURISCVState *env, bool virt)
 }
 
 #ifndef CONFIG_USER_ONLY
+typedef struct {
+    uint32_t wid;
+    /* 32-bit widlist is enough since wid is only 5-bit width. */
+    uint32_t widlist;
+    bool has_widlist;
+    bool use_mwid;
+} CPUWIDResult;
+
+static bool sswid_enabled(CPURISCVState *env) {
+    const RISCVCPUConfig *cfg = riscv_cpu_cfg(env);
+
+    return cfg->ext_sswid && env->mwiddeleg != 0;
+}
+
+/* Get CPU wid and widlist of the relevant privileged mode (priv + virt). */
+static CPUWIDResult cpu_get_wid_widlist(CPURISCVState *env, int priv, bool virt)
+{
+    const RISCVCPUConfig *cfg = riscv_cpu_cfg(env);
+    CPUWIDResult result = {0};
+    bool use_slwid = false, use_mlwid = false, use_mwid = false;
+    bool use_pmwid = false;
+
+    if (priv == PRV_U && riscv_has_ext(env, RVS) && sswid_enabled(env)) {
+        /* U/VU-mode + M/S/U-core + Sswid extension */
+        use_slwid = true;
+    } else if (priv == PRV_U && cfg->ext_smlwid) {
+        /* U/VU-mode + not use_slwid + Smlwid extension */
+        use_mlwid = true;
+    } else if (priv == PRV_S && virt && sswid_enabled(env)) {
+        /* VS-mode + Sswid extension */
+        use_slwid = true;
+    } else if (priv == PRV_S && cfg->ext_smlwid) {
+        /* S/HS/VS-mode + not use_slwid + Smlwid extension */
+        use_mlwid = true;
+    } else {
+        if (cfg->ext_smwid) {
+            use_mwid = true;
+        } else {
+            use_pmwid = true;
+        }
+    }
+
+    result.has_widlist = true;
+    result.use_mwid = false;
+    if (use_slwid) {
+        result.wid = env->slwid;
+        result.widlist = env->mwiddeleg;
+    } else if (use_mlwid) {
+        result.wid = env->mlwid;
+        result.widlist = cfg->ext_smlwidlist ? env->mlwidlist : cfg->pmlwidlist;
+    } else if (use_mwid) {
+        result.wid = env->mwid;
+        result.widlist = cfg->pmwidlist;
+        result.use_mwid = true;
+    } else if (use_pmwid) {
+        result.wid = cfg->pmwid;
+        result.has_widlist = false;
+    } else {
+        g_assert_not_reached();
+    }
+
+    return result;
+}
+
+static uint32_t riscv_cpu_wg_get_wid(CPURISCVState *env, int priv)
+{
+    CPUWIDResult result = cpu_get_wid_widlist(env, priv, env->virt_enabled);
+
+    return result.wid;
+}
+
 void riscv_cpu_set_wg_pmwid(CPURISCVState *env, uint32_t pmwid)
 {
     CPUState *cs = env_cpu(env);
@@ -1047,6 +1118,7 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
     target_ulong napot_mask;
     bool is_sstack_idx = ((mmu_idx & MMU_IDX_SS_WRITE) == MMU_IDX_SS_WRITE);
     bool sstack_page = false;
+    uint32_t wid;
 
     if (do_svukte_check(env, first_stage, mode, virt) &&
         !check_svukte_addr(env, addr)) {
@@ -1207,6 +1279,15 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
                                                MMU_DATA_LOAD, PRV_S);
         if (pmp_ret != TRANSLATE_SUCCESS) {
             return TRANSLATE_PMP_FAIL;
+        }
+
+        /*
+         * Page table walker will use S-mode WID when doing memory accesses
+         * for virtual address translation.
+         */
+        if (riscv_cpu_cfg(env)->ext_smlwid && env->wid_to_mem_attrs) {
+            wid = riscv_cpu_wg_get_wid(env, PRV_S);
+            env->wid_to_mem_attrs(&attrs, wid);
         }
 
         if (riscv_cpu_mxl(env) == MXL_RV32) {
@@ -1577,6 +1658,14 @@ bool riscv_cpu_translate_for_debug(CPUState *cs, vaddr addr,
     hwaddr phys_addr;
     int prot;
     int mmu_idx = riscv_env_mmu_index(&cpu->env, false);
+    int mode = mmuidx_priv(mmu_idx);
+    uint32_t wid;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+    if (riscv_cpu_cfg(env)->ext_smlwid && env->wid_to_mem_attrs) {
+        wid = riscv_cpu_wg_get_wid(env, mode);
+        env->wid_to_mem_attrs(&attrs, wid);
+    }
 
     if (get_physical_address(env, &phys_addr, &prot, addr, NULL, 0, mmu_idx,
                              true, env->virt_enabled, true, false)) {
@@ -1590,10 +1679,11 @@ bool riscv_cpu_translate_for_debug(CPUState *cs, vaddr addr,
         }
     }
 
+    attrs.debug = 1;
     *result = (TranslateForDebugResult) {
         .physaddr = phys_addr,
         .lg_page_size = TARGET_PAGE_BITS,
-        .attrs.debug = 1,
+        .attrs = attrs,
     };
     return true;
 }
@@ -1693,11 +1783,19 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     privilege_mode_t mode = mmuidx_priv(mmu_idx);
     /* default TLB page size */
     hwaddr tlb_size = TARGET_PAGE_SIZE;
+    uint32_t wid;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
 
     env->guest_phys_fault_addr = 0;
 
     qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
                   __func__, address, access_type, mmu_idx);
+
+    if (riscv_cpu_cfg(env)->ext_smlwid && env->wid_to_mem_attrs) {
+        mode = mmuidx_priv(mmu_idx);
+        wid = riscv_cpu_wg_get_wid(env, mode);
+        env->wid_to_mem_attrs(&attrs, wid);
+    }
 
     pmu_tlb_fill_incr_ctr(cpu, access_type);
     if (two_stage_lookup) {
@@ -1790,8 +1888,8 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
 
     if (ret == TRANSLATE_SUCCESS) {
-        tlb_set_page(cs, address & ~(tlb_size - 1), pa & ~(tlb_size - 1),
-                     prot, access_type, mmu_idx, tlb_size);
+        tlb_set_page_with_attrs(cs, address & ~(tlb_size - 1), pa & ~(tlb_size - 1),
+                                attrs, prot, access_type, mmu_idx, tlb_size);
         return true;
     } else if (probe) {
         return false;
