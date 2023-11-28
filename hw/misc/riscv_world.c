@@ -95,6 +95,128 @@ uint32_t mem_attrs_to_wid(MemTxAttrs attrs)
     }
 }
 
+static void riscv_cpu_wg_reset(CPURISCVState *env)
+{
+    CPUState *cs = env_cpu(env);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    uint32_t mlwid, slwid, mwiddeleg;
+    uint32_t trustedwid;
+
+    if (world_config == NULL) {
+        /*
+         * Note: This reset is dummy now and World CSRs will be reset again
+         * after world_config is realized.
+         */
+        return;
+    }
+
+    trace_riscv_wgcpu_reset(env->mhartid);
+
+    trustedwid = world_config->trustedwid;
+    if (trustedwid == NO_TRUSTEDWID) {
+        trustedwid = world_config->nworlds - 1;
+    }
+
+    /* Reset mlwid, slwid, mwiddeleg CSRs */
+    if (world_config->hw_bypass) {
+        /* HW bypass mode */
+        mlwid = trustedwid;
+    } else {
+        mlwid = 0;
+    }
+    slwid = 0;
+    mwiddeleg = 0;
+
+    if (riscv_cpu_cfg(env)->ext_smlwid) {
+        env->mlwid = mlwid;
+    }
+
+    if (riscv_cpu_cfg(env)->ext_sswid) {
+        env->slwid = slwid;
+    }
+
+    if (riscv_cpu_cfg(env)->ext_smwiddeleg) {
+        env->mwiddeleg = mwiddeleg;
+    }
+
+    /*
+     * Check the platform-defined values (CPU Properties):
+     * pmwid, pmwidlist, pmlwidlist
+     */
+    uint32_t valid_widlist = MAKE_64BIT_MASK(0, world_config->nworlds);
+
+    /* Use default pmwid, pmwidlist, pmlwidlist if CPU properties are not set */
+    if (cpu->cfg.pmwid == UINT32_MAX) {
+        cpu->cfg.pmwid = trustedwid;
+    }
+
+    if (cpu->cfg.pmwidlist == UINT32_MAX) {
+        cpu->cfg.pmwidlist = valid_widlist;
+    }
+
+    if (cpu->cfg.pmlwidlist == UINT32_MAX) {
+        cpu->cfg.pmlwidlist = valid_widlist;
+    }
+
+    /* Check if pmwid/pmwidlist/pmlwidlist HW config is valid in NWorld. */
+    g_assert(cpu->cfg.pmwid < world_config->nworlds);
+    g_assert((cpu->cfg.pmwidlist & ~valid_widlist) == 0);
+    g_assert((cpu->cfg.pmlwidlist & ~valid_widlist) == 0);
+
+    /* Reset mwid, mlwidlist CSRs based on platform-defined values. */
+    if (riscv_cpu_cfg(env)->ext_smwid) {
+        env->mwid = cpu->cfg.pmwid;
+    }
+
+    if (riscv_cpu_cfg(env)->ext_smlwidlist) {
+        env->mlwidlist = cpu->cfg.pmwidlist;
+    }
+}
+
+/*
+ * riscv_world_apply_cpu - Apply global World resources to CPU.
+ *
+ * Note: This API should be used after global World device is created
+ * (riscv_world_realize()).
+ */
+void riscv_world_apply_cpu(uint32_t hartid, bool enable_cpu_exts)
+{
+    CPUState *cpu = cpu_by_arch_id(hartid);
+    RISCVCPU *rcpu = RISCV_CPU(cpu);
+    CPURISCVState *env = cpu ? cpu_env(cpu) : NULL;
+
+    /* World global config should exist */
+    g_assert(world_config);
+
+    /* If the CPU with this hartid doesn't exist */
+    if (env == NULL) {
+        return;
+    }
+
+    /*
+     * Enable CPU extensions of RV World automatically.
+     *
+     * Note: Here is too late to enable World CSRs for GDB. If you'd like to
+     * use GDB to access World CSRs, please enable it via CPU options directly.
+     */
+    if (enable_cpu_exts) {
+        rcpu->cfg.ext_smlwid = true;
+        rcpu->cfg.ext_smwid = true;
+        rcpu->cfg.ext_smlwidlist = true;
+        if (riscv_has_ext(env, RVS) && riscv_has_ext(env, RVU)) {
+            rcpu->cfg.ext_sswid = true;
+            rcpu->cfg.ext_smwiddeleg = true;
+        }
+    }
+
+    /* Set machine specific callback of RV World */
+    env->wg_reset = riscv_cpu_wg_reset;
+    env->wid_to_mem_attrs = wid_to_mem_attrs;
+
+    /* Reset World CSRs in CPU */
+    env->wg_reset(env);
+}
+
 bool could_access_wgblocks(MemTxAttrs attrs, const char *wgblock)
 {
     uint32_t wid = mem_attrs_to_wid(attrs);
