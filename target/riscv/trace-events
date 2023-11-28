@@ -12,3 +12,9 @@ mseccfg_csr_write(uint64_t mhartid, uint64_t val) "hart %" PRIu64 ": write msecc
 
 # op_helper.c
 riscv_exception(uint32_t exception, const char *desc, uint64_t epc) "%u (%s) on epc 0x%"PRIx64""
+
+wg_mlwid_csr_write(int hartid, uint64_t pc, uint64_t mlwid_val, bool valid) "hartid: %d, pc: 0x%"PRIx64", val: %"PRIu64", is-mlwid-valid: %d"
+wg_slwid_csr_write(int hartid, uint64_t pc, uint64_t slwid_val, bool valid) "hartid: %d, pc: 0x%"PRIx64", val: %"PRIu64", is-slwid-valid: %d"
+wg_mwiddeleg_csr_write(int hartid, uint64_t pc, uint64_t mwiddeleg, bool valid) "hartid: %d, pc: 0x%"PRIx64", mwiddeleg: %"PRIu64", is-slwid-valid: %d"
+wg_mwid_csr_write(int hartid, uint64_t pc, uint64_t mwiddeleg, bool valid, bool locked) "hartid: %d, pc: 0x%"PRIx64", mwiddeleg: %"PRIu64", is-slwid-valid: %d, lock CSR: %d"
+wg_mlwidlist_csr_write(int hartid, uint64_t pc, uint64_t mwiddeleg, bool valid) "hartid: %d, pc: 0x%"PRIx64", mwiddeleg: %"PRIu64", is-slwid-valid: %d"
