@@ -32,6 +32,7 @@
 #include "qapi/error.h"
 #include "tcg/insn-start-words.h"
 #include "internals.h"
+#include "trace.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "target/riscv/tcg/debug.h"
 #endif
@@ -5568,6 +5569,217 @@ static RISCVException write_mnstatus(CPURISCVState *env, int csrno,
     return RISCV_EXCP_NONE;
 }
 
+/* RISC-V World */
+static RISCVException smlwid(CPURISCVState *env, int csrno)
+{
+    if (!riscv_cpu_cfg(env)->ext_smlwid) {
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    return umode(env, csrno);
+}
+
+static RISCVException sswid(CPURISCVState *env, int csrno)
+{
+    RISCVException ret;
+
+    if (!riscv_cpu_cfg(env)->ext_sswid) {
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    ret = smode(env, csrno);
+
+    if (ret != RISCV_EXCP_NONE) {
+        return ret;
+    }
+
+    return umode(env, csrno);
+}
+
+static RISCVException smwiddeleg(CPURISCVState *env, int csrno)
+{
+    RISCVException ret;
+
+    if (!riscv_cpu_cfg(env)->ext_smwiddeleg) {
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    ret = smode(env, csrno);
+
+    if (ret != RISCV_EXCP_NONE) {
+        return ret;
+    }
+
+    return umode(env, csrno);
+}
+
+static RISCVException smwid(CPURISCVState *env, int csrno)
+{
+    if (!riscv_cpu_cfg(env)->ext_smwid) {
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException smlwidlist(CPURISCVState *env, int csrno)
+{
+    if (!riscv_cpu_cfg(env)->ext_smlwidlist) {
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    return umode(env, csrno);
+}
+
+static bool is_wid_valid(target_ulong wid, target_ulong widlist) {
+    return BIT(wid) & widlist;
+}
+
+static RISCVException rmw_mlwid(CPURISCVState *env, int csrno,
+                                target_ulong *ret_val,
+                                target_ulong new_val, target_ulong wr_mask)
+{
+    CPUState *cs = env_cpu(env);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    target_ulong new_mlwid = (env->mlwid & ~wr_mask) | (new_val & wr_mask);
+    bool is_valid = true;
+
+    if (ret_val) {
+        *ret_val = env->mlwid;
+    }
+
+    g_assert(cpu->cfg.pmlwidlist);
+
+    is_valid = is_wid_valid(new_mlwid, cpu->cfg.pmlwidlist);
+    trace_wg_mlwid_csr_write(env->mhartid, env->pc, new_mlwid, is_valid);
+
+    if (env->mlwid != new_mlwid) {
+        env->mlwid = new_mlwid;
+        tlb_flush(cs);
+    }
+
+
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException rmw_slwid(CPURISCVState *env, int csrno,
+                                target_ulong *ret_val,
+                                target_ulong new_val, target_ulong wr_mask)
+{
+    target_ulong new_slwid = (env->slwid & ~wr_mask) | (new_val & wr_mask);
+    bool is_valid = true;
+
+    if (!env->mwiddeleg) {
+        /*
+         * When mwiddeleg CSR is zero, access to slwid raises an illegal
+         * instruction exception.
+         */
+        return RISCV_EXCP_ILLEGAL_INST;
+    }
+
+    if (ret_val) {
+        *ret_val = env->slwid;
+    }
+
+    is_valid = is_wid_valid(new_slwid, env->mwiddeleg);
+    trace_wg_slwid_csr_write(env->mhartid, env->pc, new_slwid, is_valid);
+
+    if (env->slwid != new_slwid) {
+        env->slwid = new_slwid;
+        tlb_flush(env_cpu(env));
+    }
+
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException rmw_mwiddeleg(CPURISCVState *env, int csrno,
+                                    target_ulong *ret_val,
+                                    target_ulong new_val, target_ulong wr_mask)
+{
+    CPUState *cs = env_cpu(env);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    bool is_valid = true;
+
+    if (ret_val) {
+        *ret_val = env->mwiddeleg;
+    }
+
+    env->mwiddeleg = (env->mwiddeleg & ~wr_mask) | (new_val & wr_mask);
+
+    /* Core wgMarker can only have WID value in pmlwidlist. */
+    env->mwiddeleg &= cpu->cfg.pmlwidlist;
+
+
+    is_valid = is_wid_valid(env->slwid, env->mwiddeleg);
+    trace_wg_mwiddeleg_csr_write(env->mhartid, env->pc, env->mwiddeleg, is_valid);
+
+    return RISCV_EXCP_NONE;
+}
+
+static inline bool mwid_locked(CPURISCVState *env) {
+    /* lock bit is XLEN-1 */
+    return env->mwid & (0x1 << (riscv_cpu_mxl_bits(env) - 1));
+}
+
+static RISCVException rmw_mwid(CPURISCVState *env, int csrno,
+                               target_ulong *ret_val,
+                               target_ulong new_val, target_ulong wr_mask)
+{
+    CPUState *cs = env_cpu(env);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    target_ulong new_mwid = (env->mwid & ~wr_mask) | (new_val & wr_mask);
+    bool is_valid = true;
+    bool locked = mwid_locked(env);
+
+    if (ret_val) {
+        *ret_val = env->mwid;
+    }
+
+    g_assert(cpu->cfg.pmwidlist);
+
+    if (locked) {
+        return RISCV_EXCP_NONE;
+    }
+
+    is_valid = is_wid_valid(new_mwid, cpu->cfg.pmwidlist);
+
+    if (env->mwid != new_mwid) {
+        env->mwid = new_mwid;
+        tlb_flush(cs);
+    }
+
+    locked = mwid_locked(env);
+    trace_wg_mwid_csr_write(env->mhartid, env->pc, env->mwid, is_valid, locked);
+
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException rmw_mlwidlist(CPURISCVState *env, int csrno,
+                                    target_ulong *ret_val,
+                                    target_ulong new_val, target_ulong wr_mask)
+{
+    RISCVCPU *cpu = RISCV_CPU(env_cpu(env));
+    bool is_valid = true;
+    bool locked = mwid_locked(env);
+
+    if (ret_val) {
+        *ret_val = env->mlwidlist;
+    }
+
+    if (locked) {
+        return RISCV_EXCP_NONE;
+    }
+
+    env->mlwidlist = (env->mlwidlist & ~wr_mask) | (new_val & wr_mask);
+
+    /* mlwidlist can only contain WIDs in pmwidlist */
+    env->mlwidlist &= cpu->cfg.pmwidlist;
+
+    is_valid = is_wid_valid(env->mlwid, env->mlwidlist);
+    trace_wg_mlwidlist_csr_write(env->mhartid, env->pc, env->mlwidlist, is_valid);
+
+    return RISCV_EXCP_NONE;
+}
 #endif
 
 /* Crypto Extension */
@@ -6770,5 +6982,11 @@ riscv_csr_operations csr_ops[CSR_TABLE_SIZE] = {
     [CSR_SCOUNTOVF]      = { "scountovf", sscofpmf,  read_scountovf,
                              .min_priv_ver = PRIV_VERSION_1_12_0 },
 
+    /* RISC-V World */
+    [CSR_MLWID]     = { "mlwid",     smlwid,      NULL, NULL, rmw_mlwid },
+    [CSR_SLWID]     = { "slwid",     sswid,       NULL, NULL, rmw_slwid },
+    [CSR_MWIDDELEG] = { "mwiddeleg", smwiddeleg,  NULL, NULL, rmw_mwiddeleg },
+    [CSR_MWID]      = { "mwid",      smwid,       NULL, NULL, rmw_mwid },
+    [CSR_MLWIDLIST] = { "mlwidlist", smlwidlist,  NULL, NULL, rmw_mlwidlist },
 #endif /* !CONFIG_USER_ONLY */
 };

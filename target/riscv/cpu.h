@@ -540,6 +540,13 @@ struct CPUArchState {
     uint64_t kvm_timer_frequency;
 #endif /* CONFIG_KVM */
 
+    /* RISC-V World */
+    target_ulong mlwid;
+    target_ulong slwid;
+    target_ulong mwiddeleg;
+    target_ulong mwid;
+    target_ulong mlwidlist;
+
     /* machine specific WorldGuard callback */
     void (*wg_reset)(CPURISCVState *env);
     void (*wid_to_mem_attrs)(MemTxAttrs *attrs, uint32_t wid);
