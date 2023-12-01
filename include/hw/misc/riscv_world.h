@@ -45,6 +45,7 @@ struct RISCVWorldState {
 };
 
 extern struct RISCVWorldState *world_config;
+extern uint64_t wgc_slot_perm_mask;
 
 DeviceState *riscv_world_create(uint32_t nworlds, uint32_t trustedwid,
                                  bool hw_bypass, bool tz_compat);
@@ -87,9 +88,12 @@ struct WgCheckerRegion {
 struct RISCVWgCheckerState {
     /*< private >*/
     SysBusDevice parent_obj;
+    uint32_t num_default_slots;
+    WgCheckerSlot *default_slots;
 
     /*< public >*/
     MemoryRegion mmio;
+    WgCheckerSlot *slots;
     qemu_irq irq;
 
     /* error reg */
