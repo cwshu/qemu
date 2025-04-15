@@ -682,6 +682,9 @@ void riscv_cpu_interrupt(CPURISCVState *env);
 #define BOOL_TO_MASK(x) (-!!(x)) /* helper for riscv_cpu_update_mip value */
 
 RISCVException smstateen_acc_ok(CPURISCVState *env, int index, uint64_t bit);
+void riscv_cpu_set_wg_pmwid(CPURISCVState *env, uint32_t pmwid);
+void riscv_cpu_set_wg_pmlwidlist(CPURISCVState *env, uint32_t pmlwidlist);
+void riscv_cpu_set_wg_pmwidlist(CPURISCVState *env, uint32_t pmwidlist);
 #endif /* !CONFIG_USER_ONLY */
 
 void riscv_cpu_set_mode(CPURISCVState *env, privilege_mode_t newpriv,

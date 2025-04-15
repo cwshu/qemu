@@ -185,5 +185,9 @@ TYPED_FIELD(uint32_t, pmp_granularity, 0)
 
 TYPED_FIELD(int8_t, max_satp_mode, -1)
 
+TYPED_FIELD(uint32_t, pmwid, 0)
+TYPED_FIELD(uint32_t, pmlwidlist, 0)
+TYPED_FIELD(uint32_t, pmwidlist, 0)
+
 #undef BOOL_FIELD
 #undef TYPED_FIELD
