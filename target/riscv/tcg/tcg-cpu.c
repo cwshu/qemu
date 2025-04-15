@@ -887,6 +887,22 @@ void riscv_cpu_validate_set_extensions(RISCVCPU *cpu, Error **errp)
         return;
     }
 
+    /* RISC-V World */
+    if (cpu->cfg.ext_sswid && !cpu->cfg.ext_smlwid) {
+        error_setg(errp, "Sswid extension requires Smlwid extension");
+        return;
+    }
+
+    if (cpu->cfg.ext_smwiddeleg != cpu->cfg.ext_sswid) {
+        error_setg(errp, "Smwiddeleg/Sswid extensions should be enabled together");
+        return;
+    }
+
+    if (cpu->cfg.ext_smlwidlist && !(cpu->cfg.ext_smwid && cpu->cfg.ext_smlwid)) {
+        error_setg(errp, "Smlwidlist extension requires both Smwid and Smlwid extension");
+        return;
+    }
+
     /*
      * Disable isa extensions based on priv spec after we
      * validated and set everything we need.
