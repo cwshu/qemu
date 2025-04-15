@@ -816,6 +816,22 @@ void riscv_cpu_validate_set_extensions(RISCVCPU *cpu, Error **errp)
         return;
     }
 
+    /* RISC-V World */
+    if (cpu->cfg.ext_sswid && !cpu->cfg.ext_smlwid) {
+        error_setg(errp, "Sswid extension requires Smlwid extension");
+        return;
+    }
+
+    if (cpu->cfg.ext_smwiddeleg != cpu->cfg.ext_sswid) {
+        error_setg(errp, "Smwiddeleg/Sswid extensions should be enabled together");
+        return;
+    }
+
+    if (cpu->cfg.ext_smlwidlist && !(cpu->cfg.ext_smwid && cpu->cfg.ext_smlwid)) {
+        error_setg(errp, "Smlwidlist extension requires both Smwid and Smlwid extension");
+        return;
+    }
+
 #ifndef CONFIG_USER_ONLY
     if (cpu->cfg.ext_svpbmt && cpu->cfg.max_satp_mode < VM_1_10_SV39) {
         cpu->cfg.ext_svpbmt = false;
