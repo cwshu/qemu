@@ -2892,6 +2892,10 @@ static const Property riscv_cpu_properties[] = {
      * it with -x and default to 'false'.
      */
     DEFINE_PROP_BOOL("x-misa-w", RISCVCPU, cfg.misa_w, false),
+
+    DEFINE_PROP_UINT32("x-pmwid", RISCVCPU, cfg.pmwid, UINT32_MAX),
+    DEFINE_PROP_UINT32("x-pmlwidlist", RISCVCPU, cfg.pmlwidlist, UINT32_MAX),
+    DEFINE_PROP_UINT32("x-pmwidlist", RISCVCPU, cfg.pmwidlist, UINT32_MAX),
 };
 
 static const gchar *riscv_gdb_arch_name(CPUState *cs)
