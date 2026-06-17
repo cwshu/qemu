@@ -203,6 +203,21 @@ static uint32_t riscv_cpu_wg_get_wid(CPURISCVState *env, int priv)
     return result.wid;
 }
 
+/*
+ * Check if the CPU WID is in the allowed list or not,
+ */
+static bool riscv_cpu_wid_is_legal(CPURISCVState *env)
+{
+    CPUWIDResult result = cpu_get_wid_widlist(env, env->priv, env->virt_enabled);
+
+    if (result.has_widlist) {
+        /* Check if wid is in the widlist */
+        return BIT(result.wid) & result.widlist;
+    } else {
+        return true;
+    }
+}
+
 void riscv_cpu_set_wg_pmwid(CPURISCVState *env, uint32_t pmwid)
 {
     CPUState *cs = env_cpu(env);
@@ -1953,6 +1968,24 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
                   __func__, address, access_type, mmu_idx);
 
+    /* Illegal world trap occurs if CPU WID is NOT in the allowed list */
+    if (!riscv_cpu_wid_is_legal(env)) {
+        CPUWIDResult result = cpu_get_wid_widlist(env, env->priv, env->virt_enabled);
+
+        if (result.use_mwid) {
+            /*
+             * Assigning a WID value to mwid that is not enabled by pmwidlist mask
+             * will result in the hart’s transactions being trapped.
+             * This will result in a complete hang of the hart.
+             */
+            cpu_abort(CPU(cpu), "CPU invalid world error from CSR: mwid");
+        } else {
+            env->sw_check_code = RISCV_EXCP_SW_CHECK_ILLEGAL_WORLD;
+            riscv_raise_exception(env, RISCV_EXCP_SW_CHECK, retaddr);
+        }
+    }
+
+    /* Add the CPU WID into MemTxAttrs */
     if (riscv_cpu_cfg(env)->ext_smlwid && env->wid_to_mem_attrs) {
         mode = mmuidx_priv(mmu_idx);
         wid = riscv_cpu_wg_get_wid(env, mode);
